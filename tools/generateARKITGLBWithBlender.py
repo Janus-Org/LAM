@@ -161,10 +161,12 @@ def convert_with_blender(
     ]
 
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8')
-
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8')
+        logger.info(f"Blender stdout: {result.stdout}")
     except subprocess.CalledProcessError as e:
-        logger.error(f"Blender conversion failed: {e.stderr}")
+        logger.error(f"Blender conversion failed (exit code {e.returncode})")
+        logger.error(f"Blender stdout: {e.stdout}")
+        logger.error(f"Blender stderr: {e.stderr}")
         raise
     logger.info(f"GLB output saved to {output_glb}")
 
@@ -224,17 +226,29 @@ def generate_glb(
     try:
         # Step 1: Shape parameter injection
         update_flame_shape(input_mesh, temp_files["ascii"], template_fbx)
+        if not temp_files["ascii"].exists():
+            raise FileNotFoundError(f"Step 1 failed: ASCII FBX was not created at {temp_files['ascii']}")
+        logger.info(f"Step 1 complete: ASCII FBX created ({temp_files['ascii'].stat().st_size} bytes)")
 
         # Step 2: FBX format conversion
         convert_ascii_to_binary(temp_files["ascii"], temp_files["binary"])
+        if not temp_files["binary"].exists():
+            raise FileNotFoundError(f"Step 2 failed: Binary FBX was not created at {temp_files['binary']}")
+        logger.info(f"Step 2 complete: Binary FBX created ({temp_files['binary'].stat().st_size} bytes)")
 
         # Step 3: Blender conversion
+        output_glb.parent.mkdir(parents=True, exist_ok=True)
         convert_with_blender(temp_files["binary"], output_glb, blender_exec)
+        if not output_glb.exists():
+            raise FileNotFoundError(f"Step 3 failed: GLB was not created at {output_glb}")
+        logger.info(f"Step 3 complete: GLB created ({output_glb.stat().st_size} bytes)")
 
         # Step 4: Vertex Order Generation
-        gen_vertex_order_with_blender(input_mesh,
-                                      Path(os.path.join(os.path.dirname(output_glb),'vertex_order.json')),
-                                      blender_exec)
+        vertex_order_path = Path(os.path.join(os.path.dirname(output_glb), 'vertex_order.json'))
+        gen_vertex_order_with_blender(input_mesh, vertex_order_path, blender_exec)
+        if not vertex_order_path.exists():
+            raise FileNotFoundError(f"Step 4 failed: vertex_order.json was not created at {vertex_order_path}")
+        logger.info(f"Step 4 complete: vertex_order.json created ({vertex_order_path.stat().st_size} bytes)")
 
     finally:
         # Cleanup temporary files
