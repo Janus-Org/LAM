@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2025, The Alibaba 3DAIGC Team Authors. 
+# Copyright (c) 2024-2025, The Alibaba 3DAIGC Team Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,9 @@ import cv2
 import sys
 import base64
 import subprocess
+import traceback
+import time
+from contextlib import contextmanager
 
 import gradio as gr
 import numpy as np
@@ -30,8 +33,78 @@ from glob import glob
 import moviepy.editor as mpy
 from lam.utils.ffmpeg_utils import images_to_video
 from tools.flame_tracking_single_image import FlameTrackingSingleImage
+
 # from gradio_gaussian_render import gaussian_render
 from lam.runners.infer.head_utils import prepare_motion_seqs, preprocess_image
+
+
+# =============================================================================
+# Pipeline Profiler
+# =============================================================================
+class PipelineProfiler:
+    """Simple profiler for measuring pipeline step durations."""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.results: list[tuple[str, float]] = []
+
+    @contextmanager
+    def profile(self, step_name: str):
+        """Context manager for profiling a pipeline step."""
+        if not self.enabled:
+            yield
+            return
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            duration_ms = (time.perf_counter() - start) * 1000
+            self.results.append((step_name, duration_ms))
+            print(f"[PROFILE] {step_name}: {duration_ms:.2f}ms")
+
+    def reset(self):
+        self.results = []
+
+    def summary(self) -> str:
+        if not self.results:
+            return "No profiling results."
+
+        total = sum(d for _, d in self.results)
+        lines = [
+            "",
+            "=" * 70,
+            "PIPELINE PROFILING SUMMARY",
+            "=" * 70,
+            f"{'Step':<45} {'Time (ms)':>12} {'%':>8}",
+            "-" * 70,
+        ]
+        for name, ms in self.results:
+            pct = (ms / total * 100) if total > 0 else 0
+            lines.append(f"{name:<45} {ms:>12.2f} {pct:>7.1f}%")
+        lines.append("-" * 70)
+        lines.append(f"{'TOTAL':<45} {total:>12.2f} {'100.0%':>8}")
+        lines.append("=" * 70)
+
+        # Bottlenecks
+        sorted_results = sorted(self.results, key=lambda x: x[1], reverse=True)
+        lines.append("\nTOP BOTTLENECKS:")
+        for i, (name, ms) in enumerate(sorted_results[:5], 1):
+            pct = (ms / total * 100) if total > 0 else 0
+            lines.append(f"  {i}. {name}: {ms:.2f}ms ({pct:.1f}%)")
+
+        fps = 1000 / total if total > 0 else 0
+        lines.append(f"\nPotential throughput: {fps:.2f} FPS")
+        lines.append("=" * 70)
+        return "\n".join(lines)
+
+
+profiler = PipelineProfiler(enabled=True)
 
 try:
     import spaces
@@ -43,65 +116,66 @@ h5_rendering = False  # True
 
 
 def launch_env_not_compile_with_cuda():
-    os.system('pip install chumpy')
-    os.system('pip install numpy==1.23.0')
+    os.system("pip install chumpy")
+    os.system("pip install numpy==1.23.0")
     os.system(
-        'pip install --no-index --no-cache-dir pytorch3d -f https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu121_pyt251/download.html'
+        "pip install --no-index --no-cache-dir pytorch3d -f https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu121_pyt251/download.html"
     )
 
 
 def assert_input_image(input_image):
     if input_image is None:
-        raise gr.Error('No image selected or uploaded!')
+        raise gr.Error("No image selected or uploaded!")
 
 
 def prepare_working_dir():
     import tempfile
+
     working_dir = tempfile.TemporaryDirectory()
     return working_dir
 
 
 def init_preprocessor():
     from lam.utils.preprocess import Preprocessor
+
     global preprocessor
     preprocessor = Preprocessor()
 
 
-def preprocess_fn(image_in: np.ndarray, remove_bg: bool, recenter: bool,
-                  working_dir):
-    image_raw = os.path.join(working_dir.name, 'raw.png')
+def preprocess_fn(image_in: np.ndarray, remove_bg: bool, recenter: bool, working_dir):
+    image_raw = os.path.join(working_dir.name, "raw.png")
     with Image.fromarray(image_in) as img:
         img.save(image_raw)
-    image_out = os.path.join(working_dir.name, 'rembg.png')
-    success = preprocessor.preprocess(image_path=image_raw,
-                                      save_path=image_out,
-                                      rmbg=remove_bg,
-                                      recenter=recenter)
-    assert success, f'Failed under preprocess_fn!'
+    image_out = os.path.join(working_dir.name, "rembg.png")
+    success = preprocessor.preprocess(
+        image_path=image_raw, save_path=image_out, rmbg=remove_bg, recenter=recenter
+    )
+    assert success, f"Failed under preprocess_fn!"
     return image_out
 
 
 def get_image_base64(path):
-    with open(path, 'rb') as image_file:
+    with open(path, "rb") as image_file:
         encoded_string = base64.b64encode(image_file.read()).decode()
-    return f'data:image/png;base64,{encoded_string}'
+    return f"data:image/png;base64,{encoded_string}"
 
 
 def doRender():
-     print('do render')
+    print("do render")
 
 
 def save_images2video(img_lst, v_pth, fps):
     from moviepy.editor import ImageSequenceClip
+
     # Ensure all images are in uint8 format
     images = [image.astype(np.uint8) for image in img_lst]
-    
+
     # Create an ImageSequenceClip from the list of images
     clip = ImageSequenceClip(images, fps=fps)
-    
+
     # Write the clip to a video file
-    clip.write_videofile(v_pth, codec='libx264')
-    
+    clip.write_videofile(v_pth, codec="libx264")
+
     print(f"Video saved successfully at {v_pth}")
 
 
@@ -119,17 +193,18 @@ def add_audio_to_video(video_path, out_path, audio_path):
     video_clip_with_audio = video_clip.set_audio(audio_clip)
 
     # Export final video with audio using standard codecs
-    video_clip_with_audio.write_videofile(out_path, codec='libx264', audio_codec='aac')
+    video_clip_with_audio.write_videofile(out_path, codec="libx264", audio_codec="aac")
 
     print(f"Audio added successfully at {out_path}")
 
-def parse_configs():
 
+def parse_configs():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str)
     parser.add_argument("--infer", type=str)
-    parser.add_argument("--blender_path", type=str,
-                        default='blender' ,help="Path to Blender executable")
+    parser.add_argument(
+        "--blender_path", type=str, default="blender", help="Path to Blender executable"
+    )
     args, unknown = parser.parse_known_args()
 
     cfg = OmegaConf.create()
@@ -185,36 +260,50 @@ def parse_configs():
     return cfg, cfg_train
 
 
-def create_zip_archive(output_zip='runtime_/h5_render_data.zip', base_vid="nice"):
-    flame_params_pth = os.path.join("./assets/sample_motion/export", base_vid, "flame_params.json")
+def create_zip_archive(output_zip="runtime_/h5_render_data.zip", base_vid="nice"):
+    flame_params_pth = os.path.join(
+        "./assets/sample_motion/export", base_vid, "flame_params.json"
+    )
     file_lst = [
-        'runtime_data/lbs_weight_20k.json', 'runtime_data/offset.ply', 'runtime_data/skin.glb',
-        'runtime_data/vertex_order.json', 'runtime_data/bone_tree.json', 
-        flame_params_pth
+        "runtime_data/lbs_weight_20k.json",
+        "runtime_data/offset.ply",
+        "runtime_data/skin.glb",
+        "runtime_data/vertex_order.json",
+        "runtime_data/bone_tree.json",
+        flame_params_pth,
     ]
     try:
         # Create a new ZIP file in write mode
-        with zipfile.ZipFile(output_zip, 'w') as zipf:
+        with zipfile.ZipFile(output_zip, "w") as zipf:
             # List all files in the specified directory
             for file_path in file_lst:
-                zipf.write(file_path, arcname=os.path.join("h5_render_data", os.path.basename(file_path)))
+                zipf.write(
+                    file_path,
+                    arcname=os.path.join("h5_render_data", os.path.basename(file_path)),
+                )
         print(f"Archive created successfully: {output_zip}")
     except Exception as e:
         print(f"An error occurred: {e}")
 
 
 def demo_lam(flametracking, lam, cfg):
-
     # @spaces.GPU(duration=80)
     def core_fn(image_path: str, video_params, working_dir, enable_oac_file):
-        image_raw = os.path.join(working_dir.name, "raw.png")
-        with Image.open(image_path).convert('RGB') as img:
-            img.save(image_raw)
-        
+        profiler.reset()
+
+        with profiler.profile("1. Load and save input image"):
+            image_raw = os.path.join(working_dir.name, "raw.png")
+            with Image.open(image_path).convert("RGB") as img:
+                img.save(image_raw)
+
         base_vid = os.path.basename(video_params).split(".")[0]
-        flame_params_dir = os.path.join("./assets/sample_motion/export", base_vid, "flame_param")
-        base_iid = os.path.basename(image_path).split('.')[0]
-        image_path = os.path.join("./assets/sample_input", base_iid, "images/00000_00.png")
+        flame_params_dir = os.path.join(
+            "./assets/sample_motion/export", base_vid, "flame_param"
+        )
+        base_iid = os.path.basename(image_path).split(".")[0]
+        image_path = os.path.join(
+            "./assets/sample_input", base_iid, "images/00000_00.png"
+        )
 
         dump_video_path = os.path.join(working_dir.name, "output.mp4")
         dump_image_path = os.path.join(working_dir.name, "output.png")
@@ -224,9 +313,7 @@ def demo_lam(flametracking, lam, cfg):
         image_name = os.path.basename(image_raw)
         uid = image_name.split(".")[0]
         subdir_path = os.path.dirname(image_raw).replace(omit_prefix, "")
-        subdir_path = (
-            subdir_path[1:] if subdir_path.startswith("/") else subdir_path
-        )
+        subdir_path = subdir_path[1:] if subdir_path.startswith("/") else subdir_path
         print("subdir_path and uid:", subdir_path, uid)
 
         motion_seqs_dir = flame_params_dir
@@ -245,128 +332,286 @@ def demo_lam(flametracking, lam, cfg):
         vis_motion = cfg.get("vis_motion", False)  # False
 
         # preprocess input image: segmentation, flame params estimation
-        return_code = flametracking.preprocess(image_raw)
-        assert (return_code == 0), "flametracking preprocess failed!"
-        return_code = flametracking.optimize()
-        assert (return_code == 0), "flametracking optimize failed!"
-        return_code, output_dir = flametracking.export()
-        assert (return_code == 0), "flametracking export failed!"
+        with profiler.profile("2. FlameTracking preprocess (detect/crop/matting/landmarks)"):
+            return_code = flametracking.preprocess(image_raw)
+            assert return_code == 0, "flametracking preprocess failed!"
+
+        with profiler.profile("3. FlameTracking optimize (FLAME fitting)"):
+            return_code = flametracking.optimize()
+            assert return_code == 0, "flametracking optimize failed!"
+
+        with profiler.profile("4. FlameTracking export"):
+            return_code, output_dir = flametracking.export()
+            assert return_code == 0, "flametracking export failed!"
 
         image_path = os.path.join(output_dir, "images/00000_00.png")
         mask_path = os.path.join(output_dir, "fg_masks/00000_00.png")
-        print("image_path:", image_path, "\n"+"mask_path:", mask_path)
+        print("image_path:", image_path, "\n" + "mask_path:", mask_path)
 
-        aspect_standard = 1.0/1.0
+        aspect_standard = 1.0 / 1.0
         source_size = cfg.source_size
         render_size = cfg.render_size
         render_fps = 30
-        # prepare reference image
-        image, _, _, shape_param = preprocess_image(image_path, mask_path=mask_path, intr=None, pad_ratio=0, bg_color=1., 
-                                             max_tgt_size=None, aspect_standard=aspect_standard, enlarge_ratio=[1.0, 1.0],
-                                             render_tgt_size=source_size, multiply=14, need_mask=True, get_shape_param=True)
 
-        # save masked image for vis
-        save_ref_img_path = os.path.join(dump_tmp_dir, "output.png")
-        vis_ref_img = (image[0].permute(1, 2, 0).cpu().detach().numpy() * 255).astype(np.uint8)
-        Image.fromarray(vis_ref_img).save(save_ref_img_path)
+        with profiler.profile("5. Preprocess reference image"):
+            # prepare reference image
+            image, _, _, shape_param = preprocess_image(
+                image_path,
+                mask_path=mask_path,
+                intr=None,
+                pad_ratio=0,
+                bg_color=1.0,
+                max_tgt_size=None,
+                aspect_standard=aspect_standard,
+                enlarge_ratio=[1.0, 1.0],
+                render_tgt_size=source_size,
+                multiply=14,
+                need_mask=True,
+                get_shape_param=True,
+            )
 
-        # prepare motion seq
-        src = image_path.split('/')[-3]
-        driven = motion_seqs_dir.split('/')[-2]
-        src_driven = [src, driven]
-        motion_seq = prepare_motion_seqs(motion_seqs_dir, None, save_root=dump_tmp_dir, fps=render_fps,
-                                            bg_color=1., aspect_standard=aspect_standard, enlarge_ratio=[1.0, 1,0],
-                                            render_image_res=render_size,  multiply=16, 
-                                            need_mask=motion_img_need_mask, vis_motion=vis_motion, 
-                                            shape_param=shape_param, test_sample=False, cross_id=False, src_driven=src_driven)
+        with profiler.profile("6. Save masked reference image"):
+            # save masked image for vis
+            save_ref_img_path = os.path.join(dump_tmp_dir, "output.png")
+            vis_ref_img = (image[0].permute(1, 2, 0).cpu().detach().numpy() * 255).astype(
+                np.uint8
+            )
+            Image.fromarray(vis_ref_img).save(save_ref_img_path)
+
+        with profiler.profile("7. Prepare motion sequences (load FLAME params)"):
+            # prepare motion seq
+            src = image_path.split("/")[-3]
+            driven = motion_seqs_dir.split("/")[-2]
+            src_driven = [src, driven]
+            motion_seq = prepare_motion_seqs(
+                motion_seqs_dir,
+                None,
+                save_root=dump_tmp_dir,
+                fps=render_fps,
+                bg_color=1.0,
+                aspect_standard=aspect_standard,
+                enlarge_ratio=[1.0, 1, 0],
+                render_image_res=render_size,
+                multiply=16,
+                need_mask=motion_img_need_mask,
+                vis_motion=vis_motion,
+                shape_param=shape_param,
+                test_sample=False,
+                cross_id=False,
+                src_driven=src_driven,
+            )
 
         # start inference
         motion_seq["flame_params"]["betas"] = shape_param.unsqueeze(0)
         device, dtype = "cuda", torch.float32
         print("start to inference...................")
+
+        # Detailed LAM profiling: separate avatar creation from per-frame rendering
         with torch.no_grad():
-            # TODO check device and dtype
-            res = lam.infer_single_view(image.unsqueeze(0).to(device, dtype), None, None, 
-                                        render_c2ws=motion_seq["render_c2ws"].to(device),
-                                        render_intrs=motion_seq["render_intrs"].to(device),
-                                        render_bg_colors=motion_seq["render_bg_colors"].to(device),
-                                        flame_params={k:v.to(device) for k, v in motion_seq["flame_params"].items()})
-        
+            from collections import defaultdict
+            from einops import rearrange
+
+            image_input = image.unsqueeze(0).to(device, dtype)
+            render_c2ws = motion_seq["render_c2ws"].to(device)
+            render_intrs = motion_seq["render_intrs"].to(device)
+            render_bg_colors = motion_seq["render_bg_colors"].to(device)
+            flame_params = {k: v.to(device) for k, v in motion_seq["flame_params"].items()}
+
+            render_h = int(render_intrs[0, 0, 1, 2] * 2)
+            render_w = int(render_intrs[0, 0, 0, 2] * 2)
+            num_views = render_c2ws.shape[1]
+
+            # 8a. ONE-TIME: Create avatar (query points + latent features + Gaussian model)
+            with profiler.profile("8a. Avatar creation (one-time neural network)"):
+                query_points = None
+                if lam.latent_query_points_type.startswith("e2e_flame"):
+                    query_points, flame_params = lam.renderer.get_query_points(
+                        flame_params, device=image_input.device
+                    )
+                latent_points, image_feats = lam.forward_latent_points(
+                    image_input[:, 0], camera=None, query_points=query_points
+                )
+                image_feats_bchw = rearrange(
+                    image_feats, "b (h w) c -> b c h w",
+                    h=int((image_feats.shape[1]) ** 0.5)
+                )
+                gs_model_list, query_points, flame_params, _ = lam.renderer.forward_gs(
+                    gs_hidden_features=latent_points,
+                    query_points=query_points,
+                    flame_data=flame_params,
+                    additional_features={
+                        "image_feats": image_feats,
+                        "image": image_input[:, 0],
+                        "image_feats_bchw": image_feats_bchw
+                    }
+                )
+
+            # 8b. PER-FRAME: Animate and render each frame
+            render_res_list = []
+            per_frame_times = []
+
+            for view_idx in range(num_views):
+                frame_start = time.perf_counter()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+                render_res = lam.renderer.forward_animate_gs(
+                    gs_model_list,
+                    query_points,
+                    lam.renderer.get_single_view_smpl_data(flame_params, view_idx),
+                    render_c2ws[:, view_idx:view_idx+1],
+                    render_intrs[:, view_idx:view_idx+1],
+                    render_h,
+                    render_w,
+                    render_bg_colors[:, view_idx:view_idx+1]
+                )
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                frame_time = (time.perf_counter() - frame_start) * 1000
+                per_frame_times.append(frame_time)
+                render_res_list.append(render_res)
+
+            # Log per-frame stats
+            avg_frame_time = sum(per_frame_times) / len(per_frame_times)
+            min_frame_time = min(per_frame_times)
+            max_frame_time = max(per_frame_times)
+            potential_fps = 1000 / avg_frame_time if avg_frame_time > 0 else 0
+
+            profiler.results.append((
+                f"8b. Per-frame render ({num_views} frames, avg {avg_frame_time:.2f}ms)",
+                sum(per_frame_times)
+            ))
+            print(f"[PROFILE] 8b. Per-frame rendering: {num_views} frames")
+            print(f"          Total: {sum(per_frame_times):.2f}ms")
+            print(f"          Avg: {avg_frame_time:.2f}ms, Min: {min_frame_time:.2f}ms, Max: {max_frame_time:.2f}ms")
+            print(f"          Potential FPS (render only): {potential_fps:.1f}")
+
+            # Combine results
+            out = defaultdict(list)
+            for render_res in render_res_list:
+                for k, v in render_res.items():
+                    out[k].append(v)
+            for k, v in out.items():
+                if isinstance(v[0], torch.Tensor):
+                    out[k] = torch.concat(v, dim=1)
+                    if k in ["comp_rgb", "comp_mask", "comp_depth"]:
+                        out[k] = out[k][0].permute(0, 2, 3, 1)
+                else:
+                    out[k] = v
+            out['cano_gs_lst'] = gs_model_list
+            res = out
+
         # save h5 rendering info
         if h5_rendering:
-            h5_fd = "./runtime_data"
-            lam.renderer.flame_model.save_h5_info(shape_param.unsqueeze(0).cuda(), fd=h5_fd)
-            res['cano_gs_lst'][0].save_ply(os.path.join(h5_fd, "offset.ply"), rgb2sh=False, offset2xyz=True)
-            cmd = "thirdparties/blender/blender --background --python 'tools/generateGLBWithBlender_v2.py'"
-            os.system(cmd)
-            create_zip_archive(output_zip='runtime_data/h5_render_data.zip', base_vid=base_vid)
+            with profiler.profile("9a. H5 rendering export"):
+                h5_fd = "./runtime_data"
+                lam.renderer.flame_model.save_h5_info(
+                    shape_param.unsqueeze(0).cuda(), fd=h5_fd
+                )
+                res["cano_gs_lst"][0].save_ply(
+                    os.path.join(h5_fd, "offset.ply"), rgb2sh=False, offset2xyz=True
+                )
+                cmd = "thirdparties/blender/blender --background --python 'tools/generateGLBWithBlender_v2.py'"
+                os.system(cmd)
+                create_zip_archive(
+                    output_zip="runtime_data/h5_render_data.zip", base_vid=base_vid
+                )
 
         if enable_oac_file:
-            try:
-                from tools.generateARKITGLBWithBlender import generate_glb
-                from pathlib import Path
-                import shutil
-                import patoolib
-
-                oac_dir = os.path.join('./output/open_avatar_chat', base_iid)
-                saved_head_path = lam.renderer.flame_model.save_shaped_mesh(shape_param.unsqueeze(0).cuda(), fd=oac_dir)
-                res['cano_gs_lst'][0].save_ply(os.path.join(oac_dir, "offset.ply"), rgb2sh=False, offset2xyz=True)
-                generate_glb(
-                    input_mesh=Path(saved_head_path),
-                    template_fbx=Path("./assets/sample_oac/template_file.fbx"),
-                    output_glb=Path(os.path.join(oac_dir, "skin.glb")),
-                    blender_exec=Path(cfg.blender_path)
-                )
-                shutil.copy(
-                    src='./assets/sample_oac/animation.glb',
-                    dst=os.path.join(oac_dir, 'animation.glb')
-                )
-                os.remove(saved_head_path)
-
-                output_zip_path = os.path.join('./output/open_avatar_chat', base_iid + '.zip')
-                if os.path.exists(output_zip_path):
-                    os.remove(output_zip_path)
-                original_cwd = os.getcwd()
-                oac_parent_dir = os.path.dirname(oac_dir)
-                base_iid_dir = os.path.basename(oac_dir)
-                os.chdir(oac_parent_dir)
+            with profiler.profile("9b. OAC file generation"):
                 try:
-                    patoolib.create_archive(
-                        archive=os.path.abspath(output_zip_path),
-                        filenames=[base_iid_dir],
-                        verbosity=-1,
-                        program='zip'
-                    )
-                finally:
-                    os.chdir(original_cwd)
-                shutil.rmtree(oac_dir)
-            except Exception as e:
-                output_zip_path = f"Archive creation failed: {str(e)}"
+                    from tools.generateARKITGLBWithBlender import generate_glb
+                    from pathlib import Path
+                    import shutil
+                    import patoolib
 
-        rgb = res["comp_rgb"].detach().cpu().numpy()  # [Nv, H, W, 3], 0-1
-        mask = res["comp_mask"].detach().cpu().numpy()  # [Nv, H, W, 3], 0-1
-        mask[mask < 0.5] = 0.0
-        rgb = rgb * mask + (1 - mask) * 1
-        rgb = (np.clip(rgb, 0, 1.0) * 255).astype(np.uint8)
-        if vis_motion:
-            vis_ref_img = np.tile(
-                cv2.resize(vis_ref_img, (rgb[0].shape[1], rgb[0].shape[0]), interpolation=cv2.INTER_AREA)[None, :, :, :], 
-                (rgb.shape[0], 1, 1, 1),
-            )
-            rgb = np.concatenate([vis_ref_img, rgb, motion_seq["vis_motion_render"]], axis=2)
+                    oac_dir = os.path.join("./output/open_avatar_chat", base_iid)
+                    saved_head_path = lam.renderer.flame_model.save_shaped_mesh(
+                        shape_param.unsqueeze(0).cuda(), fd=oac_dir
+                    )
+                    res["cano_gs_lst"][0].save_ply(
+                        os.path.join(oac_dir, "offset.ply"), rgb2sh=False, offset2xyz=True
+                    )
+                    generate_glb(
+                        input_mesh=Path(saved_head_path),
+                        template_fbx=Path("./assets/sample_oac/template_file.fbx"),
+                        output_glb=Path(os.path.join(oac_dir, "skin.glb")),
+                        blender_exec=Path(cfg.blender_path),
+                    )
+                    shutil.copy(
+                        src="./assets/sample_oac/animation.glb",
+                        dst=os.path.join(oac_dir, "animation.glb"),
+                    )
+                    os.remove(saved_head_path)
+
+                    output_zip_path = os.path.join(
+                        "./output/open_avatar_chat", base_iid + ".zip"
+                    )
+                    output_zip_path = os.path.abspath(output_zip_path)
+                    if os.path.exists(output_zip_path):
+                        os.remove(output_zip_path)
+                    original_cwd = os.getcwd()
+                    oac_parent_dir = os.path.dirname(oac_dir)
+                    base_iid_dir = os.path.basename(oac_dir)
+                    os.chdir(oac_parent_dir)
+                    try:
+                        patoolib.create_archive(
+                            archive=output_zip_path,
+                            filenames=[base_iid_dir],
+                            verbosity=-1,
+                            program="zip",
+                        )
+                    finally:
+                        os.chdir(original_cwd)
+                    shutil.rmtree(oac_dir)
+                except Exception as e:
+                    print(f"Archive creation failed: {str(e)}")
+                    print("Traceback:", traceback.format_exc())
+                    output_zip_path = f"Archive creation failed: {str(e)}"
+
+        with profiler.profile("9. Post-process rendered frames"):
+            rgb = res["comp_rgb"].detach().cpu().numpy()  # [Nv, H, W, 3], 0-1
+            mask = res["comp_mask"].detach().cpu().numpy()  # [Nv, H, W, 3], 0-1
+            mask[mask < 0.5] = 0.0
+            rgb = rgb * mask + (1 - mask) * 1
+            rgb = (np.clip(rgb, 0, 1.0) * 255).astype(np.uint8)
+            if vis_motion:
+                vis_ref_img = np.tile(
+                    cv2.resize(
+                        vis_ref_img,
+                        (rgb[0].shape[1], rgb[0].shape[0]),
+                        interpolation=cv2.INTER_AREA,
+                    )[None, :, :, :],
+                    (rgb.shape[0], 1, 1, 1),
+                )
+                rgb = np.concatenate(
+                    [vis_ref_img, rgb, motion_seq["vis_motion_render"]], axis=2
+                )
 
         os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
 
-        save_images2video(rgb, dump_video_path, render_fps)
-        audio_path = os.path.join("./assets/sample_motion/export", base_vid, base_vid+".wav")
-        dump_video_path_wa = dump_video_path.replace(".mp4", "_audio.mp4")
-        add_audio_to_video(dump_video_path, dump_video_path_wa, audio_path)
+        with profiler.profile("10. Encode video (moviepy)"):
+            save_images2video(rgb, dump_video_path, render_fps)
 
-        return dump_image_path, dump_video_path_wa, output_zip_path if enable_oac_file else ''
+        with profiler.profile("11. Add audio to video"):
+            audio_path = os.path.join(
+                "./assets/sample_motion/export", base_vid, base_vid + ".wav"
+            )
+            dump_video_path_wa = dump_video_path.replace(".mp4", "_audio.mp4")
+            add_audio_to_video(dump_video_path, dump_video_path_wa, audio_path)
+
+        # Print profiling summary
+        print(profiler.summary())
+
+        return (
+            dump_image_path,
+            dump_video_path_wa,
+            output_zip_path if enable_oac_file else "",
+        )
 
     with gr.Blocks(analytics_enabled=False) as demo:
-
-        logo_url = './assets/images/logo.jpeg'
+        logo_url = "./assets/images/logo.jpeg"
         logo_base64 = get_image_base64(logo_url)
         gr.HTML(f"""
             <div style="display: flex; justify-content: center; align-items: center; text-align: center;">
@@ -381,30 +626,31 @@ def demo_lam(flametracking, lam, cfg):
 
         # DISPLAY
         with gr.Row():
-
-            with gr.Column(variant='panel', scale=1):
-                with gr.Tabs(elem_id='lam_input_image'):
-                    with gr.TabItem('Input Image'):
+            with gr.Column(variant="panel", scale=1):
+                with gr.Tabs(elem_id="lam_input_image"):
+                    with gr.TabItem("Input Image"):
                         with gr.Row():
-                            input_image = gr.Image(label='Input Image',
-                                                   image_mode='RGB',
-                                                   height=480,
-                                                   width=270,
-                                                   sources='upload',
-                                                   type='filepath', # 'numpy',
-                                                   elem_id='content_image')
+                            input_image = gr.Image(
+                                label="Input Image",
+                                image_mode="RGB",
+                                height=480,
+                                width=270,
+                                sources="upload",
+                                type="filepath",  # 'numpy',
+                                elem_id="content_image",
+                            )
                 # EXAMPLES
                 with gr.Row():
                     examples = [
-                        ['assets/sample_input/barbara.jpg'],
-                        ['assets/sample_input/cluo.jpg'],
-                        ['assets/sample_input/dufu.jpg'],
-                        ['assets/sample_input/james.png'],
-                        ['assets/sample_input/libai.jpg'],
-                        ['assets/sample_input/messi.png'],
-                        ['assets/sample_input/speed.jpg'],
-                        ['assets/sample_input/status.png'],
-                        ['assets/sample_input/zhouxingchi.jpg'],
+                        ["assets/sample_input/barbara.jpg"],
+                        ["assets/sample_input/cluo.jpg"],
+                        ["assets/sample_input/dufu.jpg"],
+                        ["assets/sample_input/james.png"],
+                        ["assets/sample_input/libai.jpg"],
+                        ["assets/sample_input/messi.png"],
+                        ["assets/sample_input/speed.jpg"],
+                        ["assets/sample_input/status.png"],
+                        ["assets/sample_input/zhouxingchi.jpg"],
                     ]
                     gr.Examples(
                         examples=examples,
@@ -413,13 +659,15 @@ def demo_lam(flametracking, lam, cfg):
                     )
 
             with gr.Column():
-                with gr.Tabs(elem_id='lam_input_video'):
-                    with gr.TabItem('Input Video'):
+                with gr.Tabs(elem_id="lam_input_video"):
+                    with gr.TabItem("Input Video"):
                         with gr.Row():
-                            video_input = gr.Video(label='Input Video',
-                                                   height=480,
-                                                   width=270,
-                                                   interactive=False)
+                            video_input = gr.Video(
+                                label="Input Video",
+                                height=480,
+                                width=270,
+                                interactive=False,
+                            )
 
                 examples = glob("./assets/sample_motion/export/*/*.mp4")
                 gr.Examples(
@@ -427,53 +675,60 @@ def demo_lam(flametracking, lam, cfg):
                     inputs=[video_input],
                     examples_per_page=20,
                 )
-            with gr.Column(variant='panel', scale=1):
-                with gr.Tabs(elem_id='lam_processed_image'):
-                    with gr.TabItem('Processed Image'):
+            with gr.Column(variant="panel", scale=1):
+                with gr.Tabs(elem_id="lam_processed_image"):
+                    with gr.TabItem("Processed Image"):
                         with gr.Row():
                             processed_image = gr.Image(
-                                label='Processed Image',
-                                image_mode='RGBA',
-                                type='filepath',
-                                elem_id='processed_image',
+                                label="Processed Image",
+                                image_mode="RGBA",
+                                type="filepath",
+                                elem_id="processed_image",
                                 height=480,
                                 width=270,
-                                interactive=False)
+                                interactive=False,
+                            )
 
-            with gr.Column(variant='panel', scale=1):
-                with gr.Tabs(elem_id='lam_render_video'):
-                    with gr.TabItem('Rendered Video'):
+            with gr.Column(variant="panel", scale=1):
+                with gr.Tabs(elem_id="lam_render_video"):
+                    with gr.TabItem("Rendered Video"):
                         with gr.Row():
-                            output_video = gr.Video(label='Rendered Video',
-                                                    format='mp4',
-                                                    height=480,
-                                                    width=270,
-                                                    autoplay=True)
+                            output_video = gr.Video(
+                                label="Rendered Video",
+                                format="mp4",
+                                height=480,
+                                width=270,
+                                autoplay=True,
+                            )
 
         # SETTING
         with gr.Row():
-            with gr.Column(variant='panel', scale=1):
-                enable_oac_file = gr.Checkbox(label="Export ZIP file for Chatting Avatar",
-                                              value=False,
-                                              visible=os.path.exists(cfg.blender_path))
-                submit = gr.Button('Generate',
-                                   elem_id='lam_generate',
-                                   variant='primary')
+            with gr.Column(variant="panel", scale=1):
+                enable_oac_file = gr.Checkbox(
+                    label="Export ZIP file for Chatting Avatar",
+                    value=False,
+                    visible=os.path.exists(cfg.blender_path),
+                )
+                submit = gr.Button(
+                    "Generate", elem_id="lam_generate", variant="primary"
+                )
                 output_zip_textbox = gr.Textbox(
                     label="Export ZIP File Path",
                     interactive=False,
                     placeholder="Export ZIP File Path ...",
-                    visible=os.path.exists(cfg.blender_path)
+                    visible=os.path.exists(cfg.blender_path),
                 )
 
         if h5_rendering:
             gr.set_static_paths("runtime_data/")
-            assetPrefix = 'gradio_api/file=runtime_data/'
+            assetPrefix = "gradio_api/file=runtime_data/"
             with gr.Row():
-                gs = gaussian_render(width = 300, height = 400, assets = assetPrefix + 'h5_render_data.zip')
+                gs = gaussian_render(
+                    width=300, height=400, assets=assetPrefix + "h5_render_data.zip"
+                )
             with gr.Row():
-                renderButton = gr.Button('H5 Rendering')
-                renderButton.click(doRender, js='''() => window.start()''')
+                renderButton = gr.Button("H5 Rendering")
+                renderButton.click(doRender, js="""() => window.start()""")
 
         working_dir = gr.State()
         submit.click(
@@ -486,8 +741,12 @@ def demo_lam(flametracking, lam, cfg):
             queue=False,
         ).success(
             fn=core_fn,
-            inputs=[input_image, video_input,
-                    working_dir, enable_oac_file],  # video_params refer to smpl dir
+            inputs=[
+                input_image,
+                video_input,
+                working_dir,
+                enable_oac_file,
+            ],  # video_params refer to smpl dir
             outputs=[processed_image, output_video, output_zip_textbox],
         )
 
@@ -501,52 +760,56 @@ def _build_model(cfg):
 
     model = ModelLAM(**cfg.model)
     resume = os.path.join(cfg.model_name, "model.safetensors")
-    print("="*100)
+    print("=" * 100)
     print("loading pretrained weight from:", resume)
-    if resume.endswith('safetensors'):
-        ckpt = load_file(resume, device='cpu')
+    if resume.endswith("safetensors"):
+        ckpt = load_file(resume, device="cpu")
     else:
-        ckpt = torch.load(resume, map_location='cpu')
+        ckpt = torch.load(resume, map_location="cpu")
     state_dict = model.state_dict()
     for k, v in ckpt.items():
         if k in state_dict:
             if state_dict[k].shape == v.shape:
                 state_dict[k].copy_(v)
             else:
-                print(f"WARN] mismatching shape for param {k}: ckpt {v.shape} != model {state_dict[k].shape}, ignored.")
+                print(
+                    f"WARN] mismatching shape for param {k}: ckpt {v.shape} != model {state_dict[k].shape}, ignored."
+                )
         else:
             print(f"WARN] unexpected param {k}: {v.shape}")
     print("finish loading pretrained weight from:", resume)
-    print("="*100)
+    print("=" * 100)
     return model
 
 
 def launch_gradio_app():
-
-    os.environ.update({
-        'APP_ENABLED': '1',
-        'APP_MODEL_NAME':
-        './model_zoo/lam_models/releases/lam/lam-20k/step_045500/',
-        'APP_INFER': './configs/inference/lam-20k-8gpu.yaml',
-        'APP_TYPE': 'infer.lam',
-        'NUMBA_THREADING_LAYER': 'omp',
-    })
+    os.environ.update(
+        {
+            "APP_ENABLED": "1",
+            "APP_MODEL_NAME": "./model_zoo/lam_models/releases/lam/lam-20k/step_045500/",
+            "APP_INFER": "./configs/inference/lam-20k-8gpu.yaml",
+            "APP_TYPE": "infer.lam",
+            "NUMBA_THREADING_LAYER": "omp",
+        }
+    )
 
     cfg, _ = parse_configs()
     lam = _build_model(cfg)
-    lam.to('cuda')
+    lam.to("cuda")
     lam.eval()
 
-    flametracking = FlameTrackingSingleImage(output_dir='output/tracking',
-                                             alignment_model_path='./model_zoo/flame_tracking_models/68_keypoints_model.pkl',
-                                             vgghead_model_path='./model_zoo/flame_tracking_models/vgghead/vgg_heads_l.trcd',
-                                             human_matting_path='./model_zoo/flame_tracking_models/matting/stylematte_synth.pt',
-                                             facebox_model_path='./model_zoo/flame_tracking_models/FaceBoxesV2.pth',
-                                             detect_iris_landmarks=False)
+    flametracking = FlameTrackingSingleImage(
+        output_dir="output/tracking",
+        alignment_model_path="./model_zoo/flame_tracking_models/68_keypoints_model.pkl",
+        vgghead_model_path="./model_zoo/flame_tracking_models/vgghead/vgg_heads_l.trcd",
+        human_matting_path="./model_zoo/flame_tracking_models/matting/stylematte_synth.pt",
+        facebox_model_path="./model_zoo/flame_tracking_models/FaceBoxesV2.pth",
+        detect_iris_landmarks=False,
+    )
 
     demo_lam(flametracking, lam, cfg)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # launch_env_not_compile_with_cuda()
     launch_gradio_app()
