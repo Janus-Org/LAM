@@ -5,7 +5,11 @@
 # Written by Ross Girshick
 # --------------------------------------------------------
 
-from .nms.cpu_nms import cpu_nms, cpu_soft_nms
+try:
+    from .nms.cpu_nms import cpu_nms, cpu_soft_nms
+except ImportError:
+    from .nms.py_cpu_nms import py_cpu_nms as cpu_nms
+    cpu_soft_nms = None
 
 def nms(dets, thresh):
     """Dispatch to either CPU or GPU NMS implementations."""
