@@ -1,1 +1,1 @@
-from .matting_engine import StyleMatteEngine
+from .matting_engine import BiRefNetMattingEngine as HumanMattingEngine
