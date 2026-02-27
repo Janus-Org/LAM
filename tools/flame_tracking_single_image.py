@@ -13,7 +13,7 @@ import yaml
 from loguru import logger
 from PIL import Image
 
-from external.human_matting import StyleMatteEngine as HumanMattingEngine
+from external.human_matting import HumanMattingEngine
 from external.landmark_detection.FaceBoxesV2.faceboxes_detector import \
     FaceBoxesDetector
 from external.landmark_detection.infer_image import Alignment
@@ -61,7 +61,7 @@ class FlameTrackingSingleImage:
             output_dir,
             alignment_model_path='./model_zoo/flame_tracking_models/68_keypoints_model.pkl',
             vgghead_model_path='./model_zoo/flame_tracking_models/vgghead/vgg_heads_l.trcd',
-            human_matting_path='./model_zoo/flame_tracking_models/matting/stylematte_synth.pt',
+            matting_model_id='ZhengPeng7/BiRefNet',
             facebox_model_path='./model_zoo/flame_tracking_models/FaceBoxesV2.pth',
             detect_iris_landmarks=False,
             args=None):
@@ -96,10 +96,8 @@ class FlameTrackingSingleImage:
             device=self.device, vggheadmodel_path=vgghead_model_path)
 
         # Load human matting model
-        assert os.path.exists(
-            human_matting_path), f'{human_matting_path} does not exist!'
         self.matting_engine = HumanMattingEngine(
-            device=self.device, human_matting_path=human_matting_path)
+            device=self.device, model_id=matting_model_id)
 
         # Load face box detector model
         assert os.path.exists(

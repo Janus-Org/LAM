@@ -802,7 +802,6 @@ def launch_gradio_app():
         output_dir="output/tracking",
         alignment_model_path="./model_zoo/flame_tracking_models/68_keypoints_model.pkl",
         vgghead_model_path="./model_zoo/flame_tracking_models/vgghead/vgg_heads_l.trcd",
-        human_matting_path="./model_zoo/flame_tracking_models/matting/stylematte_synth.pt",
         facebox_model_path="./model_zoo/flame_tracking_models/FaceBoxesV2.pth",
         detect_iris_landmarks=False,
     )

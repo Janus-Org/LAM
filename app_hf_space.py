@@ -534,7 +534,6 @@ def launch_gradio_app():
     flametracking = FlameTrackingSingleImage(output_dir='tracking_output',
                                              alignment_model_path='./pretrain_model/68_keypoints_model.pkl',
                                              vgghead_model_path='./pretrain_model/vgghead/vgg_heads_l.trcd',
-                                             human_matting_path='./pretrain_model/matting/stylematte_synth.pt',
                                              facebox_model_path='./pretrain_model/FaceBoxesV2.pth',
                                              detect_iris_landmarks=True)
 
