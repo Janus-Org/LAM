@@ -148,10 +148,10 @@ class FlameTrackingSingleImage:
         name_list = []
         frame_index = 0
 
-        # Bounding box detection
+        # Bounding box detection and FLAME parameter prediction
         frame = torchvision.io.read_image(input_image_path)[:3, ...]
         try:
-            _, frame_bbox, _ = self.vgghead_encoder(frame, frame_index)
+            vgg_results, frame_bbox, _ = self.vgghead_encoder(frame, frame_index)
         except Exception:
             logger.error("Failed to detect face")
             return ERROR_CODE["FailedToDetect"]
@@ -159,6 +159,9 @@ class FlameTrackingSingleImage:
         if frame_bbox is None:
             logger.error("Failed to detect face")
             return ERROR_CODE["FailedToDetect"]
+
+        # Store VGGHead shape prediction for tracker initialization
+        self._vgghead_shape = vgg_results["shapecode"].detach().cpu().numpy()
 
         # Expand bounding box
         name_list.append("00000.png")
@@ -256,6 +259,11 @@ class FlameTrackingSingleImage:
         landmark_path = os.path.join(landmark_output_dir, "landmarks.npz")
         np.savez(landmark_path, **landmark_data)
 
+        # Save VGGHead shape prediction for tracker initialization
+        vgghead_shape_path = os.path.join(self.sub_output_dir, "vgghead_shape.npy")
+        np.save(vgghead_shape_path, self._vgghead_shape)
+        logger.info(f"Saved VGGHead shape prediction to {vgghead_shape_path}")
+
         if self.detect_iris_landmarks_flag:
             self._detect_iris_landmarks(
                 os.path.join(output_image_dir, name_list[frame_index])
@@ -287,7 +295,19 @@ class FlameTrackingSingleImage:
             return ERROR_CODE["FailedToOptimize"]
 
         config_data.exp.output_folder = Path(self.output_tracking)
+
+        # Load VGGHead shape prediction for initialization
+        vgghead_shape_path = os.path.join(self.sub_output_dir, "vgghead_shape.npy")
+        vgghead_shape = None
+        if os.path.exists(vgghead_shape_path):
+            vgghead_shape = np.load(vgghead_shape_path)
+            logger.info("Using VGGHead shape prediction as initialization")
+
         tracker = GlobalTracker(config_data)
+
+        if vgghead_shape is not None:
+            tracker.shape.data[:] = torch.from_numpy(vgghead_shape).to(tracker.shape.device)
+
         tracker.optimize()
 
         end_time = time.time()
