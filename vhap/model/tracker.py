@@ -1200,7 +1200,8 @@ class FlameTracker:
                     epoch=epoch,
                 )
         
-        self.tb_writer.add_scalar(f"eval_mean/photo", np.mean(photo_loss), epoch)
+        if self.tb_writer is not None:
+            self.tb_writer.add_scalar(f"eval_mean/photo", np.mean(photo_loss), epoch)
 
     def prepare_output_path(self, session, frame_idx, folder_name, file_type, stage=None, step=None, epoch=None):
         if epoch is not None:
@@ -1297,14 +1298,13 @@ class GlobalTracker(FlameTracker):
 
         self.frame_idx = self.cfg.begin_frame_idx
         self.out_dir = out_dir
-        self.tb_writer = SummaryWriter(self.out_dir)
+        self.tb_writer = None  # disabled for production perf
         
         self.log_interval_scalar = self.cfg.log.interval_scalar
         self.log_interval_media = self.cfg.log.interval_media
 
         config_yaml_path = out_dir / 'config.yml'
         config_yaml_path.write_text(yaml.dump(cfg), "utf8")
-        print(tyro.to_yaml(cfg))
 
         self.logger = get_logger(__name__, root=True, log_dir=out_dir)
 
@@ -1491,19 +1491,6 @@ class GlobalTracker(FlameTracker):
                 frame_step=self.global_step, 
             )
 
-        if (self.global_step+1) % self.log_interval_media == 0:
-            self.log_media(
-                verts,
-                faces,
-                lmks,
-                albedos,
-                output_dict,
-                sample,
-                timestep_index, 
-                session="train",
-                stage=stage,
-                frame_step=self.global_step,
-            )
         del verts, faces, lmks, albedos, output_dict
         self.global_step += 1
 
