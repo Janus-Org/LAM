@@ -16,7 +16,7 @@
   \  residual_tex: true\n  tex_clusters: !!python/tuple\n  - skin\n  - hair\n  - boundary\n\
   \  - lips_tight\n  - teeth\n  - sclerae\n  - irises\n  tex_extra: true\n  tex_painted:\
   \ true\n  tex_resolution: 2048\n  use_dynamic_offset: false\n  use_static_offset:\
-  \ true\npipeline: !dataclass:PipelineConfig\n  lmk_global_tracking: !dataclass:StageLmkGlobalTrackingConfig\n\
+  \ false\npipeline: !dataclass:PipelineConfig\n  lmk_global_tracking: !dataclass:StageLmkGlobalTrackingConfig\n\
   \    disable_jawline_landmarks: false\n    num_epochs: 0\n    optimizable_params:\
   \ &id001 !!python/tuple\n    - cam\n    - pose\n    - shape\n    - joints\n    -\
   \ expr\n  lmk_init_all: !dataclass:StageLmkInitAllConfig\n    disable_jawline_landmarks:\
